@@ -5,7 +5,7 @@ import { scanReferences } from '../src/lib/scanner';
 import { parseOrdinal, formatChinese } from '../src/lib/numeral';
 import { diffDocuments, diffText, MAX_LCS_CHARS } from '../src/lib/diff';
 import { createSnapshot, sanitizeSnapshots } from '../src/lib/snapshot';
-import { cloneTree, renumberAll } from '../src/lib/tree';
+import { cloneTree, findNode, renumberAll } from '../src/lib/tree';
 import {
   createAnnotation,
   relocateAnnotations,
@@ -27,6 +27,11 @@ import {
   diffIssueBaseline,
 } from '../src/lib/issueBaseline';
 import { computeImpact } from '../src/lib/impact';
+import {
+  createSandboxPreview,
+  isSandboxStale,
+  validateSandboxOp,
+} from '../src/lib/sandbox';
 import { assert } from 'node:console';
 
 let pass = 0;
@@ -1435,6 +1440,171 @@ check('闭区间为每个目标建边', combA.edges.filter((e) => e.refKey === r
   const beforeJson = JSON.stringify(chainA);
   computeImpact(chainA, chainDoc.root[2].id);
   check('影响分析：计算不修改解析图', JSON.stringify(chainA) === beforeJson);
+}
+
+// ---- 修订沙盒：删除预演（克隆复用改写与分析、按来源节点列出、不改动正文） ----
+{
+  const sbDoc = parseDocument(`沙盒法
+
+第一条
+参见第三条至第四条。
+
+第二条
+参见第四条。
+
+第三条
+引用第九条。
+
+第四条
+内容四。`).doc;
+  renumberAll(sbDoc.root);
+  const sbA = analyze(sbDoc, { confirmed: {} });
+  const beforeJson = JSON.stringify(sbDoc);
+
+  const del = createSandboxPreview(sbDoc, sbA, {}, { kind: 'delete', articleId: sbDoc.root[2].id })!;
+  check('沙盒：删除预演生成', Boolean(del));
+  check('沙盒：预演不改动正文（克隆上执行）', JSON.stringify(sbDoc) === beforeJson);
+  // 删除第三条后原第四条变第三条：第二条中「第四条」将改写为「第三条」
+  const rw = del.rewrites.find((r) => r.raw === '第四条');
+  check('沙盒：列出将被改写的引用（原文→新文）', Boolean(rw) && rw!.text === '第三条', JSON.stringify(del.rewrites));
+  check('沙盒：改写行带来源节点与当前正文区间', rw!.nodeId === sbDoc.root[1].children[0].id && sbDoc.root[1].children[0].text.slice(rw!.start, rw!.end) === '第四条');
+  // 区间「第三条至第四条」的目标第三条被删除 → 整段不改写；被删条自身的引用不列入“不改写”
+  check('沙盒：目标删除的组合引用列为不改写', del.skipped.some((s) => s.raw === '第三条至第四条' && s.targetMissing), JSON.stringify(del.skipped));
+  check('沙盒：被删条内的引用不列入不改写', !del.skipped.some((s) => s.raw === '第九条'));
+  // 问题变化：新增断链（区间终点第四条超出剩余条数），消失断链（三→九，源节点被删）
+  check('沙盒：将新增断链', del.issuesAdded.some((i) => i.type === 'broken' && i.message.includes('第三条至第四条')), JSON.stringify(del.issuesAdded.map((i) => i.message)));
+  check('沙盒：将消失断链', del.issuesResolved.some((i) => i.type === 'broken' && i.message.includes('第九条')), JSON.stringify(del.issuesResolved.map((i) => i.message)));
+  // 新增问题可定位当前正文（源句含区间原文）
+  const addedBroken = del.issuesAdded.find((i) => i.type === 'broken')!;
+  check(
+    '沙盒：新增问题可定位当前正文',
+    addedBroken.jump !== null &&
+      addedBroken.jump.nodeId === sbDoc.root[0].children[0].id &&
+      sbDoc.root[0].children[0].text.slice(addedBroken.jump.start, addedBroken.jump.end).includes('第三条至第四条'),
+    JSON.stringify(addedBroken.jump),
+  );
+  // 消失问题定位到当前源句
+  const resolvedBroken = del.issuesResolved.find((i) => i.type === 'broken')!;
+  check('沙盒：消失问题定位当前源句', resolvedBroken.jump !== null && resolvedBroken.jump.nodeId === sbDoc.root[2].children[0].id);
+  // 预演文档结构正确：删除后剩 3 条，原第四条位于第 3 位
+  check('沙盒：预演文档结构正确', del.previewDoc.root.length === 3 && del.previewDoc.root[2].id === sbDoc.root[3].id);
+  check('沙盒：预演文档已重新分析出新断链', analyze(del.previewDoc, { confirmed: {} }).issues.some((i) => i.type === 'broken'));
+  // 版本记录与失效判定
+  check('沙盒：记录生成时文档版本', del.baseUpdatedAt === sbDoc.updatedAt);
+  check('沙盒：正文未变化时判定有效', !isSandboxStale(del, sbDoc));
+  check('沙盒：正文变化后判定失效', isSandboxStale(del, { ...sbDoc, updatedAt: sbDoc.updatedAt + 1 }));
+}
+
+// ---- 修订沙盒：移位 / 换号预演与参数校验 ----
+{
+  const mvDoc = parseDocument(`移位法
+
+第一条
+参见第四条。
+
+第二条
+内容二。
+
+第三条
+内容三。
+
+第四条
+内容四。`).doc;
+  renumberAll(mvDoc.root);
+  const mvA = analyze(mvDoc, { confirmed: {} });
+  const mv = createSandboxPreview(mvDoc, mvA, {}, { kind: 'move', articleId: mvDoc.root[0].id, targetOrdinal: 4 })!;
+  // 移到末位后：二三四一 → 第四条变第三条 → 「第四条」将改写为「第三条」
+  const mrw = mv.rewrites.find((r) => r.raw === '第四条');
+  check('沙盒：移位预演列出改写', Boolean(mrw) && mrw!.text === '第三条', JSON.stringify(mv.rewrites));
+  check('沙盒：移位预演文档顺序正确', mv.previewDoc.root[3].id === mvDoc.root[0].id);
+  // 与直接结构操作结果一致（复用同一改写逻辑）
+  const direct = applyStructuralChange(mvDoc, mvA, (root) => {
+    const f = findNode(root, mvDoc.root[0].id)!;
+    const [n] = f.parent.splice(f.index, 1);
+    f.parent.splice(3, 0, n);
+  });
+  check('沙盒：预演结果与直接结构操作一致', JSON.stringify(mv.previewDoc.root) === JSON.stringify(direct.doc.root));
+  // 移位不改变解析图：无断链 / 循环新增或消失
+  check('沙盒：移位不产生断链/循环变化', mv.issuesAdded.length === 0 && mv.issuesResolved.length === 0);
+  // 换号：第四条换号为第一条 → 移动到第 1 位
+  const rn = createSandboxPreview(mvDoc, mvA, {}, { kind: 'renumber', articleId: mvDoc.root[3].id, targetOrdinal: 1 })!;
+  check('沙盒：换号预演文档顺序正确', rn.previewDoc.root[0].id === mvDoc.root[3].id);
+  check('沙盒：换号后引用跟随改写', rn.rewrites.some((r) => r.raw === '第四条' && r.text === '第一条'), JSON.stringify(rn.rewrites));
+  // 参数校验
+  check('沙盒：目标位置越界拒绝', validateSandboxOp(mvA, { kind: 'move', articleId: mvDoc.root[0].id, targetOrdinal: 5 }) !== null);
+  check('沙盒：目标位置为 0 拒绝', validateSandboxOp(mvA, { kind: 'move', articleId: mvDoc.root[0].id, targetOrdinal: 0 }) !== null);
+  check('沙盒：位置相同拒绝', validateSandboxOp(mvA, { kind: 'move', articleId: mvDoc.root[0].id, targetOrdinal: 1 }) !== null);
+  check('沙盒：非法操作返回 null', createSandboxPreview(mvDoc, mvA, {}, { kind: 'move', articleId: mvDoc.root[0].id, targetOrdinal: 99 }) === null);
+  check('沙盒：删除不存在的条款返回 null', createSandboxPreview(mvDoc, mvA, {}, { kind: 'delete', articleId: 'art_none' }) === null);
+}
+
+// ---- 修订沙盒：循环问题的新增与消失 ----
+{
+  const cycDoc = parseDocument(`循环沙盒法
+
+第一条
+过渡条。
+
+第二条
+参见第三条。
+
+第三条
+参见第二条。`).doc;
+  renumberAll(cycDoc.root);
+  const cycA = analyze(cycDoc, { confirmed: {} });
+  check('沙盒：当前存在循环', cycA.issues.some((i) => i.type === 'cycle'));
+  const del = createSandboxPreview(cycDoc, cycA, {}, { kind: 'delete', articleId: cycDoc.root[2].id })!;
+  check('沙盒：删除后循环将消失', del.issuesResolved.some((i) => i.type === 'cycle'), JSON.stringify(del.issuesResolved.map((i) => i.type)));
+  check('沙盒：删除后新增断链（二→三）', del.issuesAdded.some((i) => i.type === 'broken'), JSON.stringify(del.issuesAdded.map((i) => i.message)));
+  const cycRow = del.issuesResolved.find((i) => i.type === 'cycle')!;
+  check('沙盒：消失的循环可定位当前正文', cycRow.jump !== null && Boolean(cycA.nodes[cycRow.jump!.nodeId]));
+}
+
+// ---- 修订沙盒：Store 预演 → 失效 → 应用 → 整体撤销/重做 ----
+{
+  const stDoc = parseDocument(`应用法
+
+第一条
+参见第三条。
+
+第二条
+内容二。
+
+第三条
+参见第二条。`).doc;
+  renumberAll(stDoc.root);
+  const store = new AppStore({ doc: JSON.parse(JSON.stringify(stDoc)), confirmed: {}, annotations: [] });
+  const snap0 = store.getSnapshot();
+  const art2Id = snap0.doc.root[1].id;
+  const r = store.previewSandbox({ kind: 'delete', articleId: art2Id });
+  check('沙盒：Store 生成预演成功', r.ok);
+  check('沙盒：预演不改动正文', store.getSnapshot().doc === snap0.doc);
+  check('沙盒：预演不进入撤销历史', !store.getSnapshot().canUndo);
+  check('沙盒：预演未失效', !store.isSandboxStale());
+  check('沙盒：非法操作生成失败', !store.previewSandbox({ kind: 'move', articleId: art2Id, targetOrdinal: 0 }).ok);
+  // 正文变化 → 失效 → 禁止应用
+  store.updateNodeText(snap0.doc.root[0].children[0].id, '参见第三条（附注）。');
+  check('沙盒：正文变化后预演失效', store.isSandboxStale());
+  check('沙盒：失效后禁止应用', store.applySandbox() === false);
+  check('沙盒：失效后正文未被应用改动', store.getSnapshot().doc.root.length === 3);
+  // 撤销回到生成时版本 → 恢复有效
+  store.undo();
+  check('沙盒：撤销回到预演版本后恢复有效', !store.isSandboxStale());
+  // 应用：操作与全部引用改写一步提交
+  check('沙盒：应用成功', store.applySandbox());
+  const afterApply = store.getSnapshot();
+  check('沙盒：应用后删除生效', afterApply.doc.root.length === 2 && !afterApply.doc.root.some((a) => a.id === art2Id));
+  check('沙盒：应用后引用已改写', afterApply.doc.root[0].children[0].text === '参见第二条。', afterApply.doc.root[0].children[0].text);
+  check('沙盒：应用后预演清空', store.getSnapshot().sandbox === null);
+  check('沙盒：应用记录改写数量供提示', store.lastRewriteInfo?.rewritten === 1);
+  // 整体撤销：操作与全部改写一步恢复
+  store.undo();
+  const afterUndo = store.getSnapshot();
+  check('沙盒：整体撤销恢复删除的条', afterUndo.doc.root.length === 3 && afterUndo.doc.root.some((a) => a.id === art2Id));
+  check('沙盒：整体撤销恢复引用原文', afterUndo.doc.root[0].children[0].text === '参见第三条。');
+  // 整体重做
+  store.redo();
+  check('沙盒：整体重做再次应用', store.getSnapshot().doc.root.length === 2 && store.getSnapshot().doc.root[0].children[0].text === '参见第二条。');
 }
 
 console.log(`\n通过 ${pass} 项，失败 ${fail} 项`);

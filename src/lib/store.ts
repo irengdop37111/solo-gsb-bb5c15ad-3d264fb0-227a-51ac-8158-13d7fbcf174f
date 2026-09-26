@@ -39,6 +39,12 @@ import {
   scanTerms,
 } from './terminology';
 import type { TermHit, TermRule } from '../../shared/model';
+import {
+  createSandboxPreview,
+  isSandboxStale,
+  validateSandboxOp,
+} from './sandbox';
+import type { SandboxOp, SandboxPreview } from './sandbox';
 import { sampleTermRules } from './sample';
 import { uid } from './uid';
 
@@ -60,6 +66,8 @@ interface Snapshot {
   analysis: Analysis;
   /** 当前规范用语规则对当前正文的实时扫描结果（重叠消解后的命中） */
   termHits: TermHit[];
+  /** 修订沙盒：当前预演（会话内临时状态，不持久化、不进入撤销历史） */
+  sandbox: SandboxPreview | null;
   canUndo: boolean;
   canRedo: boolean;
 }
@@ -77,6 +85,8 @@ export class AppStore {
   private termHits: TermHit[] = [];
   /** 当前连续文本编辑突发的起始状态（用于合并撤销） */
   private coalesceBaseline: DocState | null = null;
+  /** 修订沙盒：当前预演（会话内临时状态；不持久化、不进入撤销历史） */
+  private sandbox: SandboxPreview | null = null;
   private listeners = new Set<() => void>();
   private saveTimer: ReturnType<typeof setTimeout> | null = null;
   lastRewriteInfo: { rewritten: number; skipped: number } | null = null;
@@ -116,6 +126,7 @@ export class AppStore {
     issueBaselines: this.issueBaselines,
     analysis: this.analysis,
     termHits: this.termHits,
+    sandbox: this.sandbox,
     canUndo: this.past.length > 0,
     canRedo: this.future.length > 0,
   });
@@ -353,6 +364,7 @@ export class AppStore {
     // 粘贴替换正文是全新文档，旧快照、问题基线与批注不再有对齐意义；规范用语规则是用户词表，予以保留
     this.snapshots = [];
     this.issueBaselines = [];
+    this.sandbox = null;
     this.commit({ doc, confirmed: {}, annotations: [], termRules: this.docState.termRules });
   }
 
@@ -373,6 +385,8 @@ export class AppStore {
     const annotations = sanitizeAnnotations(bundle.annotations);
     // 规范用语规则随 JSON 导入；旧文件缺少 termRules 时按空规则加载
     const termRules = sanitizeTermRules(bundle.termRules);
+    // 全新文档：旧预演不再有对齐意义
+    this.sandbox = null;
     renumberAll(doc.root);
     this.commit({ doc: touch(doc), confirmed, annotations, termRules });
   }
@@ -394,6 +408,7 @@ export class AppStore {
   replaceWithSample(doc: ClauseDocument): void {
     this.snapshots = [];
     this.issueBaselines = [];
+    this.sandbox = null;
     // 内置示例自带示例规则（见 sampleTermRules），同时保留用户已维护的词表
     this.commit({
       doc,
@@ -451,6 +466,55 @@ export class AppStore {
     this.issueBaselines = this.issueBaselines.filter((b) => b.id !== baselineId);
     this.scheduleSave();
     this.emit();
+  }
+
+  // ---------- 修订沙盒（会话内临时预演：不改动正文、不进入撤销历史、不持久化） ----------
+
+  /**
+   * 生成条级删除 / 移位 / 换号预演：在文档克隆上复用结构改写与分析逻辑，
+   * 正文与撤销栈不受影响。返回是否成功及失败原因。
+   */
+  previewSandbox(op: SandboxOp): { ok: boolean; error?: string } {
+    const invalid = validateSandboxOp(this.analysis, op);
+    if (invalid) return { ok: false, error: invalid };
+    const preview = createSandboxPreview(
+      this.docState.doc,
+      this.analysis,
+      this.docState.confirmed,
+      op,
+    );
+    if (!preview) return { ok: false, error: '无法生成预演，请调整操作参数' };
+    this.sandbox = preview;
+    this.emit();
+    return { ok: true };
+  }
+
+  /** 清除当前预演（不影响正文与撤销历史） */
+  clearSandbox(): void {
+    if (!this.sandbox) return;
+    this.sandbox = null;
+    this.emit();
+  }
+
+  /** 当前预演是否已失效（预演记录生成时的文档版本，正文变化后失效） */
+  isSandboxStale(): boolean {
+    return !!this.sandbox && isSandboxStale(this.sandbox, this.docState.doc);
+  }
+
+  /**
+   * 应用未失效的预演：把该操作及全部引用改写作为一步提交，可整体撤销 / 重做。
+   * 预演已失效（正文在生成后变化）时禁止应用，返回 false。
+   */
+  applySandbox(): boolean {
+    const preview = this.sandbox;
+    if (!preview || isSandboxStale(preview, this.docState.doc)) return false;
+    this.lastRewriteInfo = {
+      rewritten: preview.rewrites.length,
+      skipped: preview.skipped.length,
+    };
+    this.sandbox = null;
+    this.commit({ ...this.docState, doc: preview.previewDoc }, { structural: true });
+    return true;
   }
 
   // ---------- 歧义确认 ----------

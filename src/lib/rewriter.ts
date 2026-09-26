@@ -131,11 +131,32 @@ function renderCombinedTargets(
   );
 }
 
+/** 一处被改写的引用明细（区间为变更前正文中的偏移，供修订沙盒预演列出与定位） */
+export interface RewriteChange {
+  nodeId: string;
+  start: number;
+  end: number;
+  /** 引用原文 */
+  raw: string;
+  /** 改写后的文字 */
+  text: string;
+}
+
 export interface RewriteResult {
   doc: ClauseDocument;
   rewritten: number;
+  /** 被改写引用的明细（按分析出现顺序，即文档顺序） */
+  changes: RewriteChange[];
   /** 因断链/歧义未自动改写的引用 */
-  skipped: { nodeId: string; raw: string; reason: string; targetMissing: boolean }[];
+  skipped: {
+    nodeId: string;
+    raw: string;
+    reason: string;
+    targetMissing: boolean;
+    /** 引用在变更前正文中的区间 */
+    start: number;
+    end: number;
+  }[];
 }
 
 /**
@@ -159,6 +180,7 @@ export function applyStructuralChange(
   type Repl = { start: number; end: number; text: string };
   const replsByNode = new Map<string, Repl[]>();
   const skipped: RewriteResult['skipped'] = [];
+  const changes: RewriteChange[] = [];
   let rewritten = 0;
 
   for (const occ of prevAnalysis.occurrences) {
@@ -172,6 +194,8 @@ export function applyStructuralChange(
           raw: occ.span.raw,
           reason: occ.resolution.reason ?? '组合引用目标无法唯一定位，整段未改写',
           targetMissing: false,
+          start: occ.span.start,
+          end: occ.span.end,
         });
         continue;
       }
@@ -189,6 +213,8 @@ export function applyStructuralChange(
           raw: occ.span.raw,
           reason: `组合引用目标 ${labels.join('、')} 在本次调整中被删除，整段未改写`,
           targetMissing: true,
+          start: occ.span.start,
+          end: occ.span.end,
         });
         continue;
       }
@@ -205,6 +231,13 @@ export function applyStructuralChange(
       const list = replsByNode.get(occ.nodeId) ?? [];
       list.push({ start: occ.span.start, end: occ.span.end, text: newText });
       replsByNode.set(occ.nodeId, list);
+      changes.push({
+        nodeId: occ.nodeId,
+        start: occ.span.start,
+        end: occ.span.end,
+        raw: occ.span.raw,
+        text: newText,
+      });
       rewritten += 1;
       continue;
     }
@@ -218,6 +251,8 @@ export function applyStructuralChange(
         raw: occ.span.raw,
         reason: occ.resolution.reason ?? '目标无法定位',
         targetMissing: false,
+        start: occ.span.start,
+        end: occ.span.end,
       });
       continue;
     }
@@ -233,6 +268,8 @@ export function applyStructuralChange(
         raw: occ.span.raw,
         reason: '引用目标在本次调整中被删除',
         targetMissing: true,
+        start: occ.span.start,
+        end: occ.span.end,
       });
       continue;
     }
@@ -244,6 +281,8 @@ export function applyStructuralChange(
         raw: occ.span.raw,
         reason: occ.resolution.reason ?? '存在多个候选目标，等待用户确认',
         targetMissing: false,
+        start: occ.span.start,
+        end: occ.span.end,
       });
       continue;
     }
@@ -259,6 +298,13 @@ export function applyStructuralChange(
     const list = replsByNode.get(occ.nodeId) ?? [];
     list.push({ start: occ.span.start, end: occ.span.end, text });
     replsByNode.set(occ.nodeId, list);
+    changes.push({
+      nodeId: occ.nodeId,
+      start: occ.span.start,
+      end: occ.span.end,
+      raw: occ.span.raw,
+      text,
+    });
     rewritten += 1;
   }
 
@@ -279,5 +325,5 @@ export function applyStructuralChange(
   }
 
   const doc: ClauseDocument = touch({ ...prevDoc, root });
-  return { doc, rewritten, skipped };
+  return { doc, rewritten, changes, skipped };
 }
