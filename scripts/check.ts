@@ -27,6 +27,11 @@ import {
   diffIssueBaseline,
 } from '../src/lib/issueBaseline';
 import { computeImpact } from '../src/lib/impact';
+import {
+  buildSandboxPreview,
+  sandboxIssueJump,
+  sandboxRewriteJump,
+} from '../src/lib/sandbox';
 import { assert } from 'node:console';
 
 let pass = 0;
@@ -1435,6 +1440,233 @@ check('闭区间为每个目标建边', combA.edges.filter((e) => e.refKey === r
   const beforeJson = JSON.stringify(chainA);
   computeImpact(chainA, chainDoc.root[2].id);
   check('影响分析：计算不修改解析图', JSON.stringify(chainA) === beforeJson);
+}
+
+// ---- 修订沙盒：条级删除 / 移位 / 换号的预演、失效与一步应用 ----
+{
+  const sbText = `沙盒办法
+
+第一条【目的】
+依第二条、第三条及第五条办理。
+
+第二条【范围】
+本条引用第三条，另参见第四条。
+
+第三条【程序】
+本条援引第二条，参见第九条。
+
+第四条【过渡】
+参见第五条。
+
+第五条【附则】
+最终条款。`;
+  const mkDoc = () => parseDocument(sbText).doc;
+
+  // —— 删除预演：在克隆上复用改写与分析，不改动正文与撤销历史 ——
+  const store = new AppStore({ doc: mkDoc(), confirmed: {}, annotations: [] });
+  const art3 = store.getSnapshot().doc.root[2];
+  const beforeJson = JSON.stringify(store.getSnapshot().doc.root);
+  const res = store.runSandboxPreview({ kind: 'delete', articleId: art3.id });
+  check('沙盒：删除预演生成成功', res.ok);
+  const sb = store.getSnapshot().sandbox!;
+  check('沙盒：预演记录操作描述', sb.label === '删除第三条', sb.label);
+  check(
+    '沙盒：预演记录生成时的文档版本',
+    typeof sb.docRevision === 'number' && sb.docVersion === store.getSnapshot().doc.updatedAt,
+  );
+  check('沙盒：预演不改动正文', JSON.stringify(store.getSnapshot().doc.root) === beforeJson);
+  check('沙盒：预演不进入撤销历史', store.getSnapshot().canUndo === false);
+  check('沙盒：删除预演列出 2 处改写', sb.changes.length === 2, String(sb.changes.length));
+  check(
+    '沙盒：改写含 第四条→第三条',
+    sb.changes.some((c) => c.raw === '第四条' && c.text === '第三条'),
+  );
+  check(
+    '沙盒：改写含 第五条→第四条',
+    sb.changes.some((c) => c.raw === '第五条' && c.text === '第四条'),
+  );
+  check(
+    '沙盒：目标被删的引用不自动改写',
+    sb.skipped.length === 2 && sb.skipped.every((s) => s.targetMissing),
+    JSON.stringify(sb.skipped),
+  );
+  check(
+    '沙盒：组合引用目标被删整段不改写',
+    sb.skipped.some((s) => s.raw === '第二条、第三条及第五条'),
+  );
+  check(
+    '沙盒：将新增 1 处断链',
+    sb.issuesAdded.length === 1 && sb.issuesAdded[0].type === 'broken',
+    JSON.stringify(sb.issuesAdded.map((i) => i.message)),
+  );
+  check(
+    '沙盒：将消失 1 循环 + 1 断链',
+    sb.issuesRemoved.length === 2 &&
+      sb.issuesRemoved.some((i) => i.type === 'cycle') &&
+      sb.issuesRemoved.some((i) => i.type === 'broken'),
+    JSON.stringify(sb.issuesRemoved.map((i) => i.type)),
+  );
+  check(
+    '沙盒：新增断链可点击定位当前正文',
+    sandboxIssueJump(sb.issuesAdded[0], store.getSnapshot().analysis) !== null,
+  );
+  check(
+    '沙盒：被改写引用可点击定位当前正文',
+    sandboxRewriteJump(sb.changes[0], store.getSnapshot().analysis)?.nodeId === sb.changes[0].nodeId,
+  );
+  check(
+    '沙盒：将消失问题可点击定位当前正文',
+    sb.issuesRemoved.every((i) => sandboxIssueJump(i, store.getSnapshot().analysis) !== null),
+  );
+
+  // —— 应用：操作与全部引用改写作为一步提交，整体撤销 / 重做 ——
+  check('沙盒：未失效时可应用', store.applySandboxPreview() === true);
+  check('沙盒：应用后预演清空', store.getSnapshot().sandbox === null);
+  check('沙盒：应用后结构生效', store.getSnapshot().doc.root.length === 4);
+  check(
+    '沙盒：应用后引用改写生效',
+    store.getSnapshot().doc.root[1].children[0].text === '本条引用第三条，另参见第三条。',
+    store.getSnapshot().doc.root[1].children[0].text,
+  );
+  check(
+    '沙盒：应用为一步（撤销一次整体恢复）',
+    (store.undo(),
+    store.getSnapshot().doc.root.length === 5 &&
+      store.getSnapshot().doc.root[1].children[0].text === '本条引用第三条，另参见第四条。'),
+  );
+  check('沙盒：撤销后结构一并恢复', store.getSnapshot().doc.root[2].id === art3.id);
+  check('沙盒：重做再次应用', (store.redo(), store.getSnapshot().doc.root.length === 4));
+  check('沙盒：无预演时应用返回 false', store.applySandboxPreview() === false);
+
+  // —— 与直接结构操作结果一致（比较去除节点 id 的结构与文本投影） ——
+  const direct = new AppStore({ doc: mkDoc(), confirmed: {}, annotations: [] });
+  direct.deleteNode(direct.getSnapshot().doc.root[2].id);
+  const project = (nodes: import('../shared/model').ClauseNode[]): unknown =>
+    nodes.map((n) => ({
+      kind: n.kind,
+      ordinal: n.ordinal,
+      suffix: n.suffix ?? '',
+      title: n.title ?? '',
+      text: n.text,
+      children: project(n.children),
+    }));
+  check(
+    '沙盒：应用结果与直接删除一致',
+    JSON.stringify(project(store.getSnapshot().doc.root)) ===
+      JSON.stringify(project(direct.getSnapshot().doc.root)),
+  );
+
+  // —— 正文变化后预演失效并禁止应用 ——
+  const store2 = new AppStore({ doc: mkDoc(), confirmed: {}, annotations: [] });
+  store2.runSandboxPreview({ kind: 'delete', articleId: store2.getSnapshot().doc.root[2].id });
+  check('沙盒：生成后未失效', store2.getSnapshot().sandboxStale === false);
+  const par2 = store2.getSnapshot().doc.root[0].children[0];
+  store2.updateNodeText(par2.id, `${par2.text}修改。`);
+  check('沙盒：正文变化后预演失效', store2.getSnapshot().sandboxStale === true);
+  check('沙盒：失效后禁止应用', store2.applySandboxPreview() === false);
+  check('沙盒：失效应用不改动结构', store2.getSnapshot().doc.root.length === 5);
+  store2.discardSandboxPreview();
+  check('沙盒：放弃预演清空', store2.getSnapshot().sandbox === null);
+
+  // —— 批注等非正文提交不使预演失效（正文版本精确性） ——
+  const store3 = new AppStore({ doc: mkDoc(), confirmed: {}, annotations: [] });
+  store3.runSandboxPreview({ kind: 'delete', articleId: store3.getSnapshot().doc.root[2].id });
+  const par3 = store3.getSnapshot().doc.root[0].children[0];
+  store3.addAnnotation(par3.id, 0, 2, '批注');
+  check('沙盒：批注提交不变更正文版本', store3.getSnapshot().sandboxStale === false);
+  check('沙盒：批注后仍可应用', store3.applySandboxPreview() === true);
+
+  // —— 歧义确认记录变化同样使预演失效（确认影响改写计划） ——
+  const ambDoc = parseDocument(`确认失效法
+
+第八条
+参见第八条。
+
+第八条之一
+补充规定。
+
+第九条
+占位。`).doc;
+  ambDoc.root[1].suffix = '一';
+  const store7 = new AppStore({ doc: ambDoc, confirmed: {}, annotations: [] });
+  store7.runSandboxPreview({
+    kind: 'move',
+    articleId: store7.getSnapshot().doc.root[2].id,
+    toIndex: 0,
+  });
+  check('沙盒：确认前预演未失效', store7.getSnapshot().sandboxStale === false);
+  const ambOcc = store7
+    .getSnapshot()
+    .analysis.occurrences.find((o) => o.resolution.status === 'ambiguous')!;
+  store7.confirmAmbiguous(ambOcc.signature, ambDoc.root[1].id);
+  check('沙盒：歧义确认变化后预演失效', store7.getSnapshot().sandboxStale === true);
+  check('沙盒：确认变化后禁止应用', store7.applySandboxPreview() === false);
+
+  // —— 换号预演：组合引用随目标集合整体重渲染 ——
+  const store4 = new AppStore({ doc: mkDoc(), confirmed: {}, annotations: [] });
+  const art1 = store4.getSnapshot().doc.root[0];
+  const res4 = store4.runSandboxPreview({ kind: 'renumber', articleId: art1.id, newOrdinal: 3 });
+  check('沙盒：换号预演生成成功', res4.ok);
+  const sb4 = store4.getSnapshot().sandbox!;
+  check('沙盒：换号描述', sb4.label === '将第一条改为第三条', sb4.label);
+  check('沙盒：换号列出 3 处改写', sb4.changes.length === 3, JSON.stringify(sb4.changes));
+  check(
+    '沙盒：组合引用随目标集合重渲染',
+    sb4.changes.some((c) => c.raw === '第二条、第三条及第五条' && c.text === '第一条、第二条、第五条'),
+    JSON.stringify(sb4.changes),
+  );
+  check(
+    '沙盒：换号不断增断链与循环',
+    sb4.issuesAdded.length === 0 && sb4.issuesRemoved.length === 0,
+  );
+
+  // —— 移位预演 ——
+  const store5 = new AppStore({ doc: mkDoc(), confirmed: {}, annotations: [] });
+  const art5 = store5.getSnapshot().doc.root[4];
+  const res5 = store5.runSandboxPreview({ kind: 'move', articleId: art5.id, toIndex: 0 });
+  check('沙盒：移位预演生成成功', res5.ok);
+  const sb5 = store5.getSnapshot().sandbox!;
+  check('沙盒：移位描述', sb5.label === '将第五条移至第 1 位', sb5.label);
+  check('沙盒：移位列出 5 处改写', sb5.changes.length === 5, JSON.stringify(sb5.changes));
+  check('沙盒：移位可应用', store5.applySandboxPreview() === true);
+  check('沙盒：移位应用后目标条到首位', store5.getSnapshot().doc.root[0].id === art5.id);
+
+  // —— 无效与无变化操作 ——
+  const store6 = new AppStore({ doc: mkDoc(), confirmed: {}, annotations: [] });
+  const root6 = store6.getSnapshot().doc.root;
+  check(
+    '沙盒：移动到原位报错',
+    store6.runSandboxPreview({ kind: 'move', articleId: root6[0].id, toIndex: 0 }).ok === false,
+  );
+  check(
+    '沙盒：换号为自身报错',
+    store6.runSandboxPreview({ kind: 'renumber', articleId: root6[0].id, newOrdinal: 1 }).ok === false,
+  );
+  check(
+    '沙盒：换号超出范围报错',
+    store6.runSandboxPreview({ kind: 'renumber', articleId: root6[0].id, newOrdinal: 99 }).ok === false,
+  );
+  check(
+    '沙盒：目标不存在报错',
+    store6.runSandboxPreview({ kind: 'delete', articleId: 'art_none' }).ok === false,
+  );
+  check('沙盒：报错后不残留预演', store6.getSnapshot().sandbox === null);
+
+  // —— 预演纯计算：不修改传入的文档与分析 ——
+  const pureDoc = mkDoc();
+  const pureAnalysis = analyze(pureDoc, { confirmed: {} });
+  const pureDocJson = JSON.stringify(pureDoc.root);
+  const pureIssuesJson = JSON.stringify(pureAnalysis.issues);
+  const purePreview = buildSandboxPreview(
+    pureDoc,
+    pureAnalysis,
+    {},
+    { kind: 'delete', articleId: pureDoc.root[2].id },
+    0,
+  );
+  check('沙盒：纯函数预演成功', !('error' in purePreview));
+  check('沙盒：预演不修改传入文档', JSON.stringify(pureDoc.root) === pureDocJson);
+  check('沙盒：预演不修改传入分析', JSON.stringify(pureAnalysis.issues) === pureIssuesJson);
 }
 
 console.log(`\n通过 ${pass} 项，失败 ${fail} 项`);

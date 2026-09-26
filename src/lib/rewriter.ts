@@ -131,11 +131,26 @@ function renderCombinedTargets(
   );
 }
 
+/** 一处被原子改写的引用（区间基于调整前正文偏移，可直接定位当前正文） */
+export interface RewriteChange {
+  nodeId: string;
+  start: number;
+  end: number;
+  /** 改写前原文 */
+  raw: string;
+  /** 改写后文字 */
+  text: string;
+  /** 对应引用出现的 key（nodeId:start:end） */
+  refKey: string;
+}
+
 export interface RewriteResult {
   doc: ClauseDocument;
   rewritten: number;
   /** 因断链/歧义未自动改写的引用 */
   skipped: { nodeId: string; raw: string; reason: string; targetMissing: boolean }[];
+  /** 被改写引用的逐处明细（按文档顺序，供修订沙盒预演列出） */
+  changes: RewriteChange[];
 }
 
 /**
@@ -159,6 +174,7 @@ export function applyStructuralChange(
   type Repl = { start: number; end: number; text: string };
   const replsByNode = new Map<string, Repl[]>();
   const skipped: RewriteResult['skipped'] = [];
+  const changes: RewriteChange[] = [];
   let rewritten = 0;
 
   for (const occ of prevAnalysis.occurrences) {
@@ -206,6 +222,14 @@ export function applyStructuralChange(
       list.push({ start: occ.span.start, end: occ.span.end, text: newText });
       replsByNode.set(occ.nodeId, list);
       rewritten += 1;
+      changes.push({
+        nodeId: occ.nodeId,
+        start: occ.span.start,
+        end: occ.span.end,
+        raw: occ.span.raw,
+        text: newText,
+        refKey: occ.key,
+      });
       continue;
     }
 
@@ -260,6 +284,14 @@ export function applyStructuralChange(
     list.push({ start: occ.span.start, end: occ.span.end, text });
     replsByNode.set(occ.nodeId, list);
     rewritten += 1;
+    changes.push({
+      nodeId: occ.nodeId,
+      start: occ.span.start,
+      end: occ.span.end,
+      raw: occ.span.raw,
+      text,
+      refKey: occ.key,
+    });
   }
 
   // 按节点应用替换，偏移量累计
@@ -279,5 +311,5 @@ export function applyStructuralChange(
   }
 
   const doc: ClauseDocument = touch({ ...prevDoc, root });
-  return { doc, rewritten, skipped };
+  return { doc, rewritten, skipped, changes };
 }

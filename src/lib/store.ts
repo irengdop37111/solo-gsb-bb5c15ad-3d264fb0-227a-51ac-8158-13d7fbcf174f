@@ -23,6 +23,12 @@ import {
 } from './tree';
 
 import { applyStructuralChange } from './rewriter';
+import {
+  buildSandboxPreview,
+  confirmedEqual,
+  type SandboxOp,
+  type SandboxPreview,
+} from './sandbox';
 import { localStore, serverStore } from './storage';
 import { createSnapshot, sanitizeSnapshots } from './snapshot';
 import { createIssueBaseline, sanitizeIssueBaselines } from './issueBaseline';
@@ -60,6 +66,10 @@ interface Snapshot {
   analysis: Analysis;
   /** 当前规范用语规则对当前正文的实时扫描结果（重叠消解后的命中） */
   termHits: TermHit[];
+  /** 修订沙盒：当前预演（会话内，不持久化、不进入撤销历史） */
+  sandbox: SandboxPreview | null;
+  /** 预演生成后正文或歧义确认记录已变化：预演失效，禁止应用 */
+  sandboxStale: boolean;
   canUndo: boolean;
   canRedo: boolean;
 }
@@ -84,6 +94,10 @@ export class AppStore {
   lastAnnotationReviewCount = 0;
   /** 最近一次批量规范替换结果（供界面提示，无操作时为 null） */
   lastTermReplace: { replaced: number; stale: number } | null = null;
+  /** 修订沙盒：当前预演（会话内临时数据，不持久化、不进入撤销历史） */
+  private sandbox: SandboxPreview | null = null;
+  /** 正文版本号：仅当正文文档对象变化时递增（批注 / 规范规则 / 歧义确认不变更正文） */
+  private docRevision = 0;
 
   constructor(initial: PersistedState) {
     this.snapshots = sanitizeSnapshots(initial.snapshots);
@@ -116,6 +130,8 @@ export class AppStore {
     issueBaselines: this.issueBaselines,
     analysis: this.analysis,
     termHits: this.termHits,
+    sandbox: this.sandbox,
+    sandboxStale: this.sandbox ? this.isSandboxStale(this.sandbox) : false,
     canUndo: this.past.length > 0,
     canRedo: this.future.length > 0,
   });
@@ -134,6 +150,8 @@ export class AppStore {
     next: DocState,
     options: { coalesce?: boolean; structural?: boolean } = {},
   ): void {
+    // 正文版本号：仅正文文档对象变化时递增（批注 / 规范规则 / 歧义确认提交不变更正文）
+    const docChanged = next.doc !== this.docState.doc;
     const analysis = analyze(next.doc, { confirmed: next.confirmed });
     // 批注按调整后的正文/结构自动重定位
     const relocated = relocateAnnotations(next.annotations, next.doc);
@@ -168,6 +186,7 @@ export class AppStore {
     }
     this.future = [];
     this.docState = next;
+    if (docChanged) this.docRevision += 1;
     this.analysis = analysis;
     this.termHits = termHits;
     this.lastAnnotationReviewCount = options.structural ? relocated.reviewIds.length : 0;
@@ -188,6 +207,7 @@ export class AppStore {
   undo(): void {
     const prev = this.past.pop();
     if (!prev) return;
+    if (prev.doc !== this.docState.doc) this.docRevision += 1;
     this.future.push(this.docState);
     this.docState = prev;
     this.analysis = analyze(prev.doc, { confirmed: prev.confirmed });
@@ -204,6 +224,7 @@ export class AppStore {
   redo(): void {
     const next = this.future.pop();
     if (!next) return;
+    if (next.doc !== this.docState.doc) this.docRevision += 1;
     this.past.push(this.docState);
     this.docState = next;
     this.analysis = analyze(next.doc, { confirmed: next.confirmed });
@@ -451,6 +472,58 @@ export class AppStore {
     this.issueBaselines = this.issueBaselines.filter((b) => b.id !== baselineId);
     this.scheduleSave();
     this.emit();
+  }
+
+  // ---------- 修订沙盒（会话内预演：在文档克隆上复用结构改写与分析，不改动正文与撤销历史） ----------
+
+  /**
+   * 生成条级删除 / 移位 / 换号的修订预演。
+   * 预演在当前文档的克隆上执行，正文、确认记录与撤销历史均不受影响；
+   * 预演记录生成时的正文版本号，正文变化后失效并禁止应用。
+   */
+  runSandboxPreview(op: SandboxOp): { ok: boolean; error?: string } {
+    const built = buildSandboxPreview(
+      this.docState.doc,
+      this.analysis,
+      this.docState.confirmed,
+      op,
+      this.docRevision,
+    );
+    if ('error' in built) return { ok: false, error: built.error };
+    this.sandbox = built;
+    this.emit();
+    return { ok: true };
+  }
+
+  /** 放弃当前预演（不影响正文与撤销历史） */
+  discardSandboxPreview(): void {
+    if (!this.sandbox) return;
+    this.sandbox = null;
+    this.emit();
+  }
+
+  /** 预演失效判定：正文版本号或歧义确认记录（影响改写计划）较生成时发生变化 */
+  private isSandboxStale(preview: SandboxPreview): boolean {
+    return (
+      preview.docRevision !== this.docRevision ||
+      !confirmedEqual(preview.confirmed, this.docState.confirmed)
+    );
+  }
+
+  /**
+   * 应用当前预演：仅未失效（正文版本号与歧义确认记录均未变）时允许；
+   * 该操作及全部引用改写作为一步提交，支持整体撤销 / 重做。
+   */
+  applySandboxPreview(): boolean {
+    const preview = this.sandbox;
+    if (!preview || this.isSandboxStale(preview)) return false;
+    this.lastRewriteInfo = {
+      rewritten: preview.rewrittenCount,
+      skipped: preview.skipped.length,
+    };
+    this.sandbox = null;
+    this.commit({ ...this.docState, doc: preview.resultDoc }, { structural: true });
+    return true;
   }
 
   // ---------- 歧义确认 ----------

@@ -9,11 +9,12 @@ import { AnnotationPanel } from './components/AnnotationPanel';
 import { TermPanel } from './components/TermPanel';
 import { RelationView } from './components/RelationView';
 import { CompareView } from './components/CompareView';
+import { SandboxPanel } from './components/SandboxPanel';
 import { ImportDialog } from './components/ImportDialog';
 import { ToastHost } from './components/Toast';
 
 type ViewMode = 'edit' | 'compare';
-type SideTab = 'issues' | 'annotations' | 'terms' | 'graph';
+type SideTab = 'issues' | 'annotations' | 'terms' | 'graph' | 'sandbox';
 
 export default function App({
   store,
@@ -132,6 +133,14 @@ export default function App({
                 >
                   关系视图
                 </button>
+                <button
+                  role="tab"
+                  aria-selected={rightTab === 'sandbox'}
+                  className={rightTab === 'sandbox' ? 'active' : ''}
+                  onClick={() => setRightTab('sandbox')}
+                >
+                  修订沙盒
+                </button>
               </div>
               {rightTab === 'issues' ? (
                 <IssuePanel />
@@ -145,8 +154,10 @@ export default function App({
                   focusSignal={termFocus}
                   onConsumeFocus={() => setTermFocus(null)}
                 />
-              ) : (
+              ) : rightTab === 'graph' ? (
                 <RelationView />
+              ) : (
+                <SandboxPanel />
               )}
             </aside>
           </main>
